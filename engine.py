@@ -23,7 +23,8 @@ class Engine(object):
         self.state.setdefault('use_gpu', torch.cuda.is_available())
         self.state.setdefault('image_size', 256)
         self.state.setdefault('batch_size', 32)
-        self.state.setdefault('workers', 4)
+        self.state.setdefault('workers', 2)
+        self.state.setdefault('prefetch_factor', 1)
         self.state.setdefault('device_ids', None)
         self.state.setdefault('evaluate', False)
         self.state.setdefault('start_epoch', 0)
@@ -193,16 +194,25 @@ class Engine(object):
         train_dataset.transform = self.state['train_transform']
         val_dataset.transform = self.state['val_transform']
         
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset, 
-            batch_size=self.state['batch_size'], 
-            shuffle=True, 
-            num_workers=self.state['workers'], # 确保启动命令传了 -j 8 或 -j 12
-            pin_memory=True,                   # 必加：将数据锁页进物理内存，极大加速向 GPU 拷贝
-            prefetch_factor=4,                 # 必加：让每个 worker 提前从硬盘预读 4 个 batch
-            persistent_workers=True            # 必加：防止每个 epoch 结束后销毁进程，省去重启进程的时间
+        loader_kwargs = dict(
+            batch_size=self.state['batch_size'],
+            num_workers=self.state['workers'],
+            pin_memory=True,
         )
-        val_loader = torch.utils.data.DataLoader(val_dataset, batch_size=self.state['batch_size'], shuffle=False, num_workers=self.state['workers'])
+        if loader_kwargs['num_workers'] > 0 and self.state.get('prefetch_factor', 1) > 0:
+            loader_kwargs['prefetch_factor'] = self.state['prefetch_factor']
+            loader_kwargs['persistent_workers'] = True
+
+        train_loader = torch.utils.data.DataLoader(
+            train_dataset,
+            shuffle=True,
+            **loader_kwargs,
+        )
+        val_loader = torch.utils.data.DataLoader(
+            val_dataset,
+            shuffle=False,
+            **loader_kwargs,
+        )
 
         if self.state['use_gpu']:
             model = nn.DataParallel(model, device_ids=self.state['device_ids']).cuda()
@@ -220,7 +230,7 @@ class Engine(object):
                 self.state['best_score'] = checkpoint['best_score']
                 
                 # 2. 恢复模型权重
-                if self.state['use_gpu']:
+                if isinstance(model, nn.DataParallel):
                     model.module.load_state_dict(checkpoint['state_dict'])
                 else:
                     model.load_state_dict(checkpoint['state_dict'])
@@ -265,9 +275,11 @@ class Engine(object):
                 print(f"=> No improvement for {epochs_no_improve} epoch(s). "
                     f"Best Micro-F1: {self.state['best_score']:.4f} at epoch {self.state.get('best_epoch', -1)}")
 
+            model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
+
             self.save_checkpoint({
                 'epoch': epoch + 1,
-                'state_dict': model.module.state_dict() if self.state['use_gpu'] else model.state_dict(),
+                'state_dict': model_state,
                 'best_score': self.state['best_score'],
                 'best_epoch': self.state.get('best_epoch', -1),
                 'optimizer': optimizer.state_dict()

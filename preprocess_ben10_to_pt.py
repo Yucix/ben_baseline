@@ -1,16 +1,16 @@
-import os
+import argparse
+import concurrent.futures
 import json
-import torch
+import os
+
 import numpy as np
 import rasterio
+import torch
+import torch.nn.functional as F
 from tqdm import tqdm
-import concurrent.futures
 
-ROOT = "/media/sata/xyx/BigEarthNet/dataset"
-OUT_ROOT = os.path.join(ROOT, "processed_pt_120_clean622")
-
-S1_ROOT = os.path.join(ROOT, "BigEarthNet-S1-v1.0")
-S2_ROOT = os.path.join(ROOT, "BigEarthNet-v1.0")
+DEFAULT_ROOT = "/media/sata/xyx/BigEarthNet/dataset"
+DEFAULT_IMAGE_SIZE = 256
 
 # 论文风格：RGB + VV/VH
 S2_BANDS = ["B02", "B03", "B04"]
@@ -51,8 +51,8 @@ def read_band_raw(path):
     return arr
 
 
-def load_s2_patch(s2_patch_name):
-    patch_dir = os.path.join(S2_ROOT, s2_patch_name)
+def load_s2_patch(s2_root, s2_patch_name):
+    patch_dir = os.path.join(s2_root, s2_patch_name)
     bands = []
     for band in S2_BANDS:
         tif_path = os.path.join(patch_dir, f"{s2_patch_name}_{band}.tif")
@@ -60,8 +60,8 @@ def load_s2_patch(s2_patch_name):
     return np.stack(bands, axis=0)   # [3,H,W]
 
 
-def load_s1_patch(s1_patch_name):
-    patch_dir = os.path.join(S1_ROOT, s1_patch_name)
+def load_s1_patch(s1_root, s1_patch_name):
+    patch_dir = os.path.join(s1_root, s1_patch_name)
     bands = []
     for band in S1_BANDS:
         tif_path = os.path.join(patch_dir, f"{s1_patch_name}_{band}.tif")
@@ -69,8 +69,8 @@ def load_s1_patch(s1_patch_name):
     return np.stack(bands, axis=0)   # [2,H,W]
 
 
-def load_label_from_s1(s1_patch_name):
-    patch_dir = os.path.join(S1_ROOT, s1_patch_name)
+def load_label_from_s1(s1_root, s1_patch_name):
+    patch_dir = os.path.join(s1_root, s1_patch_name)
     json_path = os.path.join(patch_dir, f"{s1_patch_name}_labels_metadata.json")
 
     with open(json_path, "r", encoding="utf-8") as f:
@@ -89,7 +89,7 @@ def load_label_from_s1(s1_patch_name):
 
 
 def process_single_sample(args):
-    i, s2_patch_name, s1_patch_name, save_dir = args
+    i, s2_patch_name, s1_patch_name, save_dir, target_size, s1_root, s2_root = args
     save_name = f"{i:06d}_{s2_patch_name}.pt"
     save_path = os.path.join(save_dir, save_name)
 
@@ -97,10 +97,17 @@ def process_single_sample(args):
         return save_name
 
     try:
-        optical = load_s2_patch(s2_patch_name)  # [3,H,W]
-        sar = load_s1_patch(s1_patch_name)      # [2,H,W]
+        optical = load_s2_patch(s2_root, s2_patch_name)  # [3,H,W]
+        sar = load_s1_patch(s1_root, s1_patch_name)      # [2,H,W]
         image = torch.tensor(np.concatenate([optical, sar], axis=0), dtype=torch.float32)  # [5,H,W]
-        label = load_label_from_s1(s1_patch_name)
+        if image.shape[-2:] != (target_size, target_size):
+            image = F.interpolate(
+                image.unsqueeze(0),
+                size=(target_size, target_size),
+                mode="bilinear",
+                align_corners=False,
+            ).squeeze(0)
+        label = load_label_from_s1(s1_root, s1_patch_name)
 
         sample = {
             "image": image,
@@ -116,18 +123,24 @@ def process_single_sample(args):
         return None
 
 
-def process_split(split):
-    split_csv = os.path.join(ROOT, SPLIT_FILES[split])
-    save_dir = os.path.join(OUT_ROOT, split)
+def process_split(root, out_root, split, target_size, num_workers):
+    split_csv = os.path.join(root, SPLIT_FILES[split])
+    save_dir = os.path.join(out_root, split)
     os.makedirs(save_dir, exist_ok=True)
 
     with open(split_csv, "r", encoding="utf-8") as f:
         pairs = [line.strip().split(",") for line in f if line.strip()]
 
-    task_args = [(i, pair[0], pair[1], save_dir) for i, pair in enumerate(pairs)]
+    s1_root = os.path.join(root, "BigEarthNet-S1-v1.0")
+    s2_root = os.path.join(root, "BigEarthNet-v1.0")
+    task_args = [
+        (i, pair[0], pair[1], save_dir, target_size, s1_root, s2_root)
+        for i, pair in enumerate(pairs)
+    ]
     index_lines = []
 
-    num_workers = min(16, os.cpu_count() or 4)
+    if num_workers <= 0:
+        num_workers = min(16, os.cpu_count() or 4)
     print(f"[{split}] using {num_workers} workers...")
 
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
@@ -139,7 +152,7 @@ def process_split(split):
             if result is not None:
                 index_lines.append(result)
 
-    index_file = os.path.join(OUT_ROOT, f"{split}.txt")
+    index_file = os.path.join(out_root, f"{split}.txt")
     with open(index_file, "w", encoding="utf-8") as f:
         for name in index_lines:
             f.write(name + "\n")
@@ -147,11 +160,52 @@ def process_split(split):
     print(f"[done] {split}: {len(index_lines)} samples -> {save_dir}")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Preprocess BigEarthNet to pt files.")
+    parser.add_argument("--root", type=str, default=DEFAULT_ROOT, help="BigEarthNet dataset root")
+    parser.add_argument("--image-size", type=int, default=DEFAULT_IMAGE_SIZE, help="target image size")
+    parser.add_argument(
+        "--out-root",
+        type=str,
+        default="",
+        help="optional output directory. default: <root>/processed_pt_<image_size>_clean622",
+    )
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        default=["train", "val", "test"],
+        choices=["train", "val", "test"],
+        help="splits to preprocess",
+    )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=0,
+        help="process workers. <=0 means auto min(16, cpu_count)",
+    )
+    return parser.parse_args()
+
+
 def main():
-    os.makedirs(OUT_ROOT, exist_ok=True)
-    for split in ["train", "val", "test"]:
-        process_split(split)
-    print(f"all done. saved to: {OUT_ROOT}")
+    args = parse_args()
+    out_root = args.out_root or os.path.join(args.root, f"processed_pt_{args.image_size}_clean622")
+    os.makedirs(out_root, exist_ok=True)
+
+    print(f"[Config] root       : {args.root}")
+    print(f"[Config] image_size : {args.image_size}")
+    print(f"[Config] out_root   : {out_root}")
+    print(f"[Config] splits     : {args.splits}")
+    print(f"[Config] workers    : {args.num_workers if args.num_workers > 0 else 'auto'}")
+
+    for split in args.splits:
+        process_split(
+            root=args.root,
+            out_root=out_root,
+            split=split,
+            target_size=args.image_size,
+            num_workers=args.num_workers,
+        )
+    print(f"all done. saved to: {out_root}")
 
 
 if __name__ == "__main__":

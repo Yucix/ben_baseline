@@ -117,9 +117,10 @@ class TrainingLogger:
 # ===============================
 parser = argparse.ArgumentParser(description='OS Dataset Training (Optical + SAR Fusion)')
 parser.add_argument('--data', default=DEFAULT_DATA_PATH, type=str)
-parser.add_argument('--image-size', '-i', default=256, type=int)
+parser.add_argument('--image-size', '-i', default=128, type=int)
 parser.add_argument('--device_ids', default=[0], type=int, nargs='+')
 parser.add_argument('-j', '--workers', default=4, type=int)
+parser.add_argument('--prefetch-factor', default=2, type=int)
 parser.add_argument('--epochs', default=100, type=int)
 parser.add_argument('--epoch_step', default=[30, 60], type=int, nargs='+')
 parser.add_argument('--start-epoch', default=0, type=int)
@@ -167,7 +168,7 @@ def main_os():
         transform=None,
         inp_name=DEFAULT_EMBEDDING_PATH,
         image_size=args.image_size,
-        max_samples=args.train_max_samples
+        max_samples=args.train_max_samples,
     )
 
     val_dataset = BEN10Dataset(
@@ -176,7 +177,7 @@ def main_os():
         transform=None,
         inp_name=DEFAULT_EMBEDDING_PATH,
         image_size=args.image_size,
-        max_samples=args.val_max_samples
+        max_samples=args.val_max_samples,
     )
 
     # ============ Model ============
@@ -201,6 +202,7 @@ def main_os():
         'resume': args.resume,
         'num_classes': num_classes,
         'workers': args.workers,
+        'prefetch_factor': args.prefetch_factor,
         'epoch_step': args.epoch_step,
         'lr': args.lr,
         'device_ids': args.device_ids,
