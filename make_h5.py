@@ -1,3 +1,8 @@
+# python make_h5.py \
+#   --root /media/sata/xyx/BigEarthNet/dataset \
+#   --image-size 128 \
+#   --splits train val
+
 import argparse
 import os
 
@@ -6,7 +11,7 @@ import torch
 from tqdm import tqdm
 
 DEFAULT_ROOT = "/media/sata/xyx/BigEarthNet/dataset"
-DEFAULT_IMAGE_SIZE = 256
+DEFAULT_IMAGE_SIZE = 128
 
 
 def parse_args():

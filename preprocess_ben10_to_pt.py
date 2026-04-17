@@ -1,3 +1,9 @@
+# python preprocess_ben10_to_pt.py \
+#   --root /media/sata/xyx/BigEarthNet/dataset \
+#   --image-size 128 \
+#   --splits train val \
+#   --num-workers 4
+
 import argparse
 import concurrent.futures
 import json
