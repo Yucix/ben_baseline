@@ -218,6 +218,9 @@ class Engine(object):
             model = nn.DataParallel(model, device_ids=self.state['device_ids']).cuda()
             criterion = criterion.cuda()
 
+        patience = self.state.get('patience', 15)
+        epochs_no_improve = self.state.get('epochs_no_improve', 0)
+
         # Resume 断点续训逻辑
         # ==========================================
         if self.state.get('resume'):
@@ -225,9 +228,21 @@ class Engine(object):
                 print(f"=> Loading checkpoint '{self.state['resume']}'")
                 checkpoint = torch.load(self.state['resume'])
                 
-                # 1. 恢复起始 epoch 和最高分
+                # 1. 恢复起始 epoch、最好分数和最佳 epoch
                 self.state['start_epoch'] = checkpoint['epoch']
                 self.state['best_score'] = checkpoint['best_score']
+                self.state['best_epoch'] = checkpoint.get('best_epoch', self.state.get('best_epoch', -1))
+
+                # 旧 checkpoint 可能没有保存连续未提升次数，这里做兼容兜底
+                if 'epochs_no_improve' in checkpoint:
+                    epochs_no_improve = checkpoint['epochs_no_improve']
+                else:
+                    best_epoch = self.state.get('best_epoch', -1)
+                    if best_epoch > 0:
+                        epochs_no_improve = max(0, self.state['start_epoch'] - best_epoch)
+                    else:
+                        epochs_no_improve = 0
+                self.state['epochs_no_improve'] = epochs_no_improve
                 
                 # 2. 恢复模型权重
                 if isinstance(model, nn.DataParallel):
@@ -242,16 +257,17 @@ class Engine(object):
                 else:
                     print("=> Warning: No optimizer state found in checkpoint. Starting optimizer from scratch.")
                     
-                print(f"=> Loaded checkpoint (Epoch {checkpoint['epoch']}, Best Score: {checkpoint['best_score']:.4f})")
+                print(
+                    f"=> Loaded checkpoint (Epoch {checkpoint['epoch']}, "
+                    f"Best Score: {checkpoint['best_score']:.4f}, "
+                    f"No Improvement Count: {epochs_no_improve})"
+                )
             else:
                 print(f"=> No checkpoint found at '{self.state['resume']}'")
         # ==========================================
 
         if self.state['evaluate']:
             return self.validate(val_loader, model, criterion)
-
-        patience = self.state.get('patience', 15)
-        epochs_no_improve = 0
 
         for epoch in range(self.state['start_epoch'], self.state['max_epochs']):
             self.state['epoch'] = epoch
@@ -269,9 +285,11 @@ class Engine(object):
                 self.state['best_epoch'] = epoch + 1
                 self.best_metrics = self.state['meter_ap'].compute_best_threshold_metrics()
                 epochs_no_improve = 0
+                self.state['epochs_no_improve'] = epochs_no_improve
                 print(f"=> New best Micro-F1: {score:.4f} at epoch {epoch + 1}")
             else:
                 epochs_no_improve += 1
+                self.state['epochs_no_improve'] = epochs_no_improve
                 print(f"=> No improvement for {epochs_no_improve} epoch(s). "
                     f"Best Micro-F1: {self.state['best_score']:.4f} at epoch {self.state.get('best_epoch', -1)}")
 
@@ -282,6 +300,7 @@ class Engine(object):
                 'state_dict': model_state,
                 'best_score': self.state['best_score'],
                 'best_epoch': self.state.get('best_epoch', -1),
+                'epochs_no_improve': self.state.get('epochs_no_improve', epochs_no_improve),
                 'optimizer': optimizer.state_dict()
             }, is_best)
 
