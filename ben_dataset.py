@@ -109,7 +109,7 @@ class BEN10Dataset(data.Dataset):
         name = self.files[index]
 
         # 归一化
-        fusion = (fusion - BAND_MEAN) / BAND_STD
+        # fusion = (fusion - BAND_MEAN) / BAND_STD
         
         # 数据增强：与 SAR-SLICO 版本保持一致的 4 种离散增强
         if self.split == "train":
