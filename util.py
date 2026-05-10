@@ -4,11 +4,9 @@ import numpy as np
 
 class AveragePrecisionMeter(object):
     """
-    计算多标签任务指标：
-    - Macro Precision / Recall / F1
-    - Micro F1
-    - mAP
-    同时支持自动搜索最佳阈值。
+    计算多标签任务的指标，与论文对齐:
+    - Precision, Recall, F1 (宏平均，对应论文 Table 1 的 Precision, Recall, F1)
+    - Micro F1 (对应论文 Table 1 的 Micro-F1)
     """
 
     def __init__(self, difficult_examples=False):
@@ -18,6 +16,21 @@ class AveragePrecisionMeter(object):
     def reset(self):
         self.scores = torch.FloatTensor()
         self.targets = torch.LongTensor()
+
+    @staticmethod
+    def _average_precision_binary(scores, labels):
+        """Compute AP for one class with ranked predictions."""
+        order = np.argsort(-scores)
+        labels_sorted = labels[order].astype(np.float64)
+        pos_total = labels_sorted.sum()
+        if pos_total <= 0:
+            return np.nan
+
+        tp_cum = np.cumsum(labels_sorted)
+        fp_cum = np.cumsum(1.0 - labels_sorted)
+        precision = tp_cum / (tp_cum + fp_cum + 1e-12)
+        ap = np.sum(precision * labels_sorted) / (pos_total + 1e-12)
+        return ap
 
     def add(self, output, target):
         """
@@ -29,6 +42,7 @@ class AveragePrecisionMeter(object):
         if not torch.is_tensor(target):
             target = torch.tensor(target)
 
+        # 转到 CPU 存储以节省显存
         output = output.detach().cpu()
         target = target.detach().cpu()
 
@@ -66,24 +80,36 @@ class AveragePrecisionMeter(object):
 
     def compute_paper_metrics(self, threshold=0.5):
         """
-        用指定阈值计算指标。
+        计算与论文一致的指标。
+        逻辑：
+        1. Precision/Recall: 各类 P/R 的算术平均 (对应文中的 Precision/Recall)。
+        2. F1: 基于平均后的 Precision 和 Recall 计算调和平均 (对应文中的 F1)。
+        3. Micro-F1: 全局 TP/FP/FN 计算。
+        4. mAP/AP_per_class: 基于排序结果计算每类 AP，再取均值。
         """
+        # Sigmoid 激活并二值化
         probs = torch.sigmoid(self.scores).numpy()
         targets = self.targets.numpy()
         preds = (probs >= threshold).astype(np.float32)
 
+        # --- Per Class Metrics ---
+        # axis=0 对样本维求和，得到每个类别的 TP, FP, FN
         tp = np.sum((preds == 1) & (targets == 1), axis=0)
         fp = np.sum((preds == 1) & (targets == 0), axis=0)
         fn = np.sum((preds == 0) & (targets == 1), axis=0)
 
+        # 避免除以 0
         p_class = tp / (tp + fp + 1e-10)
         r_class = tp / (tp + fn + 1e-10)
         f1_class = 2 * p_class * r_class / (p_class + r_class + 1e-10)
 
-        macro_p = np.mean(p_class) * 100.0
-        macro_r = np.mean(r_class) * 100.0
-        macro_f1 = 2 * macro_p * macro_r / (macro_p + macro_r + 1e-10)
+        # --- Macro Average (对应论文 Precision, Recall, F1 列) ---
+        precision = np.mean(p_class) * 100.0
+        recall = np.mean(r_class) * 100.0
+        # 论文中的 F1 是基于平均后的 P 和 R 计算的
+        f1 = 2 * precision * recall / (precision + recall + 1e-10)
 
+        # --- Micro Average (对应论文 Micro-F1) ---
         tp_micro = np.sum(tp)
         fp_micro = np.sum(fp)
         fn_micro = np.sum(fn)
@@ -92,26 +118,22 @@ class AveragePrecisionMeter(object):
         micro_r = tp_micro / (tp_micro + fn_micro + 1e-10) * 100.0
         micro_f1 = 2 * micro_p * micro_r / (micro_p + micro_r + 1e-10)
 
-        ap_per_class = self.value().numpy()
-        mAP = np.mean(ap_per_class)
+        # --- mAP / Per-Class AP ---
+        ap_class = np.array([
+            self._average_precision_binary(probs[:, i], targets[:, i])
+            for i in range(targets.shape[1])
+        ], dtype=np.float64)
+        map_score = np.nanmean(ap_class) * 100.0 if np.any(~np.isnan(ap_class)) else 0.0
+        ap_class = np.nan_to_num(ap_class, nan=0.0) * 100.0
 
         return {
-            "mAP": mAP,
-            "Macro_P": macro_p,
-            "Macro_R": macro_r,
-            "Macro_F1": macro_f1,
+            "Precision": precision,
+            "Recall": recall,
+            "F1": f1,
             "Micro_F1": micro_f1,
-            "Per_Class_AP": ap_per_class,
+            "mAP": map_score,
+            "Per_Class_AP": ap_class,
+            "Per_Class_Precision": p_class * 100.0,
+            "Per_Class_Recall": r_class * 100.0,
             "Per_Class_F1": f1_class * 100.0,
-            "Threshold": threshold,
         }
-
-    def compute_best_threshold_metrics(self, thresholds=None):
-        """
-        固定阈值为 0.5（不再自动搜索）。
-        为兼容现有调用方，保留函数名与返回字段 Best_Threshold。
-        """
-        fixed_threshold = 0.5
-        res = self.compute_paper_metrics(threshold=fixed_threshold)
-        res["Best_Threshold"] = fixed_threshold
-        return res

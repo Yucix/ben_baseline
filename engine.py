@@ -23,8 +23,8 @@ class Engine(object):
         self.state.setdefault('use_gpu', torch.cuda.is_available())
         self.state.setdefault('image_size', 256)
         self.state.setdefault('batch_size', 32)
-        self.state.setdefault('workers', 2)
-        self.state.setdefault('prefetch_factor', 1)
+        self.state.setdefault('workers', 4)
+        self.state.setdefault('prefetch_factor', 0)
         self.state.setdefault('device_ids', None)
         self.state.setdefault('evaluate', False)
         self.state.setdefault('start_epoch', 0)
@@ -36,10 +36,34 @@ class Engine(object):
         self.state.setdefault('patience', 15)
         self.state.setdefault('best_epoch', -1)
         self.state.setdefault('epochs_no_improve', 0)
+        self.state.setdefault('threshold', None)
 
         self.state['meter_loss'] = tnt.meter.AverageValueMeter()
         self.state['batch_time'] = tnt.meter.AverageValueMeter()
         self.state['data_time'] = tnt.meter.AverageValueMeter()
+
+    def _compute_metrics_with_threshold_policy(self, ap_meter):
+        fixed_threshold = self.state.get('threshold', None)
+
+        if fixed_threshold is not None:
+            threshold = float(fixed_threshold)
+            metrics = ap_meter.compute_paper_metrics(threshold=threshold)
+            return metrics, threshold, 'fixed'
+
+        best_metrics = None
+        best_threshold = None
+        best_micro_f1 = -float('inf')
+        for threshold in np.arange(0.05, 0.951, 0.05):
+            threshold = round(float(threshold), 2)
+            metrics = ap_meter.compute_paper_metrics(threshold=threshold)
+            micro_f1 = metrics['Micro_F1']
+            if micro_f1 > best_micro_f1:
+                best_micro_f1 = micro_f1
+                best_metrics = metrics
+                best_threshold = threshold
+        print(f" Selected threshold: {best_threshold:.2f}")
+
+        return best_metrics, best_threshold, 'searched'
 
     # ===== epoch 级别 =====
     def on_start_epoch(self, training, model, criterion, data_loader, optimizer=None):
@@ -61,42 +85,42 @@ class Engine(object):
         # 验证阶段：计算指标
         if not training:
             ap_meter = self.state['meter_ap']
-            
-            res = ap_meter.compute_best_threshold_metrics()
-            
+            res, threshold_used, threshold_mode = self._compute_metrics_with_threshold_policy(ap_meter)
+            self.state['current_eval_threshold'] = threshold_used
+            self.state['current_eval_threshold_mode'] = threshold_mode
+            self.state['current_eval_metrics'] = res
+
             # 核心指标
-            macro_p = res['Macro_P']
-            macro_r = res['Macro_R']
-            macro_f1 = res['Macro_F1']
+            precision = res['Precision']
+            recall = res['Recall']
+            f1 = res['F1']
             micro_f1 = res['Micro_F1']
-            mAP = res['mAP']
+            map_score = res['mAP']
 
             ap_per_class = res['Per_Class_AP']
+            p_per_class = res['Per_Class_Precision']
+            r_per_class = res['Per_Class_Recall']
             f1_per_class = res['Per_Class_F1']
 
-            print("\n" + "="*45)
-            print(" *** Evaluation Results ***")
-            print("="*45)
-            print(f" Micro-F1 (Target): {micro_f1:.2f} %")
-            print(f" Macro-F1 (Paper F1): {macro_f1:.2f} %")
-            print(f" Macro-P (Paper P)  : {macro_p:.2f} %")
-            print(f" Macro-R (Paper R)  : {macro_r:.2f} %")
-            print(f" mAP              : {mAP:.4f}")
-            print("-" * 45)
-            print(f" Per-class F1     : {np.round(f1_per_class, 2)}")
-            print("="*45 + "\n")
+            print(f" F1               : {f1:.2f} %")
+            print(f" Micro-F1         : {micro_f1:.2f} %")
+            print(f" mAP              : {map_score:.2f} %")
 
             # === 准备日志 ===
             metrics_log = {
-                "mAP": f"{mAP:.6f}",
-                "Macro_P": f"{macro_p:.4f}",
-                "Macro_R": f"{macro_r:.4f}",
-                "Macro_F1": f"{macro_f1:.4f}",
+                "Precision": f"{precision:.4f}",
+                "Recall": f"{recall:.4f}",
+                "F1": f"{f1:.4f}",
                 "Micro_F1": f"{micro_f1:.4f}",
-                "AP_per_class": ",".join([f"{x:.4f}" for x in ap_per_class]),
+                "mAP": f"{map_score:.4f}",
+                "Threshold": f"{threshold_used:.2f}",
+                "Threshold_mode": threshold_mode,
+                "AP_per_class": ",".join([f"{x:.2f}" for x in ap_per_class]),
+                "Precision_per_class": ",".join([f"{x:.2f}" for x in p_per_class]),
+                "Recall_per_class": ",".join([f"{x:.2f}" for x in r_per_class]),
                 "F1_per_class": ",".join([f"{x:.2f}" for x in f1_per_class]),
             }
-            
+
             # 使用 Micro-F1 作为最优模型的判断标准
             score_to_return = micro_f1
 
@@ -114,7 +138,7 @@ class Engine(object):
                 loss=loss,
                 lr=lr_value,
                 metrics=metrics_log,
-                epoch_time=epoch_time
+                epoch_time=epoch_time,
             )
 
         return score_to_return if not training else loss
@@ -148,13 +172,13 @@ class Engine(object):
     def adjust_learning_rate(self, optimizer):
         epoch = self.state['epoch']
         max_epochs = self.state['max_epochs']
-        warmup_epochs = 1  # 设置前 1 个 epoch 为 Warmup 阶段
-        
+        warmup_epochs = 5  # 设置前 5 个 epoch 为 Warmup 阶段
+
         # 第一次调用时，记录每个参数组的初始学习率
         for param_group in optimizer.param_groups:
             if 'initial_lr' not in param_group:
                 param_group['initial_lr'] = param_group['lr']
-                
+
         # 计算当前 epoch 的学习率缩放比例 (scale)
         if epoch < warmup_epochs:
             # 线性 Warmup：从很小的值线性增长到 1.0
@@ -164,9 +188,9 @@ class Engine(object):
             # 将剩余的 epoch 映射到 0 ~ pi 区间
             progress = (epoch - warmup_epochs) / (max_epochs - warmup_epochs)
             scale = 0.5 * (1.0 + math.cos(math.pi * progress))
-            
+
             # 设定一个最小学习率底线 (例如初始学习率的 1%)
-            min_scale = 0.01 
+            min_scale = 0.01
             scale = min_scale + (1.0 - min_scale) * scale
 
         # 应用算出的比例
@@ -174,7 +198,7 @@ class Engine(object):
         for param_group in optimizer.param_groups:
             param_group['lr'] = param_group['initial_lr'] * scale
             lr_list.append(param_group['lr'])
-            
+
         return np.unique(lr_list)
 
     def save_checkpoint(self, state, is_best, filename='checkpoint.pth.tar'):
@@ -185,41 +209,30 @@ class Engine(object):
         if is_best:
             shutil.copyfile(
                 filepath,
-                os.path.join(path, f"model_best_{state['best_score']:.4f}.pth.tar")
+                os.path.join(path, f"model_best_{state['best_score']:.4f}.pth.tar"),
             )
-            
+
     # ===== 训练流程 =====
     def learning(self, model, criterion, train_dataset, val_dataset, optimizer):
         self.init_learning(model, criterion)
         train_dataset.transform = self.state['train_transform']
         val_dataset.transform = self.state['val_transform']
-        
-        loader_kwargs = dict(
-            batch_size=self.state['batch_size'],
-            num_workers=self.state['workers'],
-            pin_memory=True,
-        )
-        if loader_kwargs['num_workers'] > 0 and self.state.get('prefetch_factor', 1) > 0:
-            loader_kwargs['prefetch_factor'] = self.state['prefetch_factor']
+
+        loader_kwargs = {
+            'batch_size': self.state['batch_size'],
+            'num_workers': self.state['workers'],
+        }
+        prefetch_factor = int(self.state.get('prefetch_factor', 0) or 0)
+        if loader_kwargs['num_workers'] > 0 and prefetch_factor > 0:
+            loader_kwargs['prefetch_factor'] = prefetch_factor
             loader_kwargs['persistent_workers'] = True
 
-        train_loader = torch.utils.data.DataLoader(
-            train_dataset,
-            shuffle=True,
-            **loader_kwargs,
-        )
-        val_loader = torch.utils.data.DataLoader(
-            val_dataset,
-            shuffle=False,
-            **loader_kwargs,
-        )
+        train_loader = torch.utils.data.DataLoader(train_dataset, shuffle=True, **loader_kwargs)
+        val_loader = torch.utils.data.DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
         if self.state['use_gpu']:
             model = nn.DataParallel(model, device_ids=self.state['device_ids']).cuda()
             criterion = criterion.cuda()
-
-        patience = self.state.get('patience', 15)
-        epochs_no_improve = self.state.get('epochs_no_improve', 0)
 
         # Resume 断点续训逻辑
         # ==========================================
@@ -227,53 +240,46 @@ class Engine(object):
             if os.path.isfile(self.state['resume']):
                 print(f"=> Loading checkpoint '{self.state['resume']}'")
                 checkpoint = torch.load(self.state['resume'])
-                
-                # 1. 恢复起始 epoch、最好分数和最佳 epoch
+
+                # 1. 恢复起始 epoch 和最高分
                 self.state['start_epoch'] = checkpoint['epoch']
                 self.state['best_score'] = checkpoint['best_score']
-                self.state['best_epoch'] = checkpoint.get('best_epoch', self.state.get('best_epoch', -1))
 
-                # 旧 checkpoint 可能没有保存连续未提升次数，这里做兼容兜底
-                if 'epochs_no_improve' in checkpoint:
-                    epochs_no_improve = checkpoint['epochs_no_improve']
-                else:
-                    best_epoch = self.state.get('best_epoch', -1)
-                    if best_epoch > 0:
-                        epochs_no_improve = max(0, self.state['start_epoch'] - best_epoch)
-                    else:
-                        epochs_no_improve = 0
-                self.state['epochs_no_improve'] = epochs_no_improve
-                
                 # 2. 恢复模型权重
-                if isinstance(model, nn.DataParallel):
+                if self.state['use_gpu']:
                     model.module.load_state_dict(checkpoint['state_dict'])
                 else:
                     model.load_state_dict(checkpoint['state_dict'])
-                
-                # 3. 恢复优化器状态 
+
+                # 3. 恢复优化器状态
                 if 'optimizer' in checkpoint:
                     optimizer.load_state_dict(checkpoint['optimizer'])
-                    print("=> Optimizer state loaded successfully.")
+                    print('=> Optimizer state loaded successfully.')
                 else:
-                    print("=> Warning: No optimizer state found in checkpoint. Starting optimizer from scratch.")
-                    
-                print(
-                    f"=> Loaded checkpoint (Epoch {checkpoint['epoch']}, "
-                    f"Best Score: {checkpoint['best_score']:.4f}, "
-                    f"No Improvement Count: {epochs_no_improve})"
-                )
+                    print('=> Warning: No optimizer state found in checkpoint. Starting optimizer from scratch.')
+
+                print(f"=> Loaded checkpoint (Epoch {checkpoint['epoch']}, Best Score: {checkpoint['best_score']:.4f})")
             else:
                 print(f"=> No checkpoint found at '{self.state['resume']}'")
         # ==========================================
 
         if self.state['evaluate']:
-            return self.validate(val_loader, model, criterion)
+            # 纯评估模式下不会进入训练循环，需要补一个 epoch 标识用于日志与打印。
+            self.state.setdefault('epoch', self.state.get('start_epoch', 0))
+            score = self.validate(val_loader, model, criterion)
+            self.best_metrics = dict(self.state.get('current_eval_metrics', {}))
+            self.best_metrics['Threshold'] = f"{self.state.get('current_eval_threshold', 0.5):.2f}"
+            self.best_metrics['Threshold_mode'] = self.state.get('current_eval_threshold_mode', 'fixed')
+            return score
+
+        patience = self.state.get('patience', 15)
+        epochs_no_improve = 0
 
         for epoch in range(self.state['start_epoch'], self.state['max_epochs']):
             self.state['epoch'] = epoch
             lr = self.adjust_learning_rate(optimizer)
             self.state['lr'] = lr
-            print(f"Learning rate: {lr}")
+            print(f'Learning rate: {lr}')
 
             self.train(train_loader, model, criterion, optimizer)
             score = self.validate(val_loader, model, criterion)
@@ -283,38 +289,42 @@ class Engine(object):
             if is_best:
                 self.state['best_score'] = score
                 self.state['best_epoch'] = epoch + 1
-                self.best_metrics = self.state['meter_ap'].compute_best_threshold_metrics()
+                self.best_metrics = dict(self.state.get('current_eval_metrics', {}))
+                self.best_metrics['Threshold'] = f"{self.state.get('current_eval_threshold', 0.5):.2f}"
+                self.best_metrics['Threshold_mode'] = self.state.get('current_eval_threshold_mode', 'fixed')
                 epochs_no_improve = 0
-                self.state['epochs_no_improve'] = epochs_no_improve
-                print(f"=> New best Micro-F1: {score:.4f} at epoch {epoch + 1}")
+                print(f'=> New best Micro-F1: {score:.4f} at epoch {epoch + 1}')
             else:
                 epochs_no_improve += 1
-                self.state['epochs_no_improve'] = epochs_no_improve
-                print(f"=> No improvement for {epochs_no_improve} epoch(s). "
-                    f"Best Micro-F1: {self.state['best_score']:.4f} at epoch {self.state.get('best_epoch', -1)}")
+                print(
+                    f"=> No improvement for {epochs_no_improve} epoch(s). "
+                    f"Best Micro-F1: {self.state['best_score']:.4f} at epoch {self.state.get('best_epoch', -1)}"
+                )
 
-            model_state = model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict()
-
-            self.save_checkpoint({
-                'epoch': epoch + 1,
-                'state_dict': model_state,
-                'best_score': self.state['best_score'],
-                'best_epoch': self.state.get('best_epoch', -1),
-                'epochs_no_improve': self.state.get('epochs_no_improve', epochs_no_improve),
-                'optimizer': optimizer.state_dict()
-            }, is_best)
+            self.save_checkpoint(
+                {
+                    'epoch': epoch + 1,
+                    'state_dict': model.module.state_dict() if self.state['use_gpu'] else model.state_dict(),
+                    'best_score': self.state['best_score'],
+                    'best_epoch': self.state.get('best_epoch', -1),
+                    'optimizer': optimizer.state_dict(),
+                },
+                is_best,
+            )
 
             if self.state.get('early_stop', False) and epochs_no_improve >= patience:
-                print(f"=> Early stopping triggered at epoch {epoch + 1}. "
-                    f"Best Micro-F1: {self.state['best_score']:.4f} at epoch {self.state.get('best_epoch', -1)}")
+                print(
+                    f"=> Early stopping triggered at epoch {epoch + 1}. "
+                    f"Best Micro-F1: {self.state['best_score']:.4f} at epoch {self.state.get('best_epoch', -1)}"
+                )
                 break
         return self.state['best_score']
-    
+
     def train(self, data_loader, model, criterion, optimizer):
         self.state['epoch_start_time'] = time.time()
         model.train()
         self.on_start_epoch(True, model, criterion, data_loader, optimizer)
-        
+
         for i, (input, target) in enumerate(tqdm(data_loader, desc='Training')):
             self.state['iteration'] = i
             self.state['input'] = input
@@ -324,14 +334,14 @@ class Engine(object):
                 self.state['target'] = self.state['target'].cuda(non_blocking=True)
             self.on_forward(True, model, criterion, data_loader, optimizer)
             self.on_end_batch(True, model, criterion, data_loader, optimizer)
-            
+
         self.on_end_epoch(True, model, criterion, data_loader, optimizer)
 
     def validate(self, data_loader, model, criterion):
         self.state['epoch_start_time'] = time.time()
         model.eval()
         self.on_start_epoch(False, model, criterion, data_loader)
-        
+
         with torch.no_grad():
             for i, (input, target) in enumerate(tqdm(data_loader, desc='Validation')):
                 self.state['iteration'] = i
@@ -342,25 +352,27 @@ class Engine(object):
                     self.state['target'] = self.state['target'].cuda(non_blocking=True)
                 self.on_forward(False, model, criterion, data_loader)
                 self.on_end_batch(False, model, criterion, data_loader)
-                
+
         return self.on_end_epoch(False, model, criterion, data_loader)
 
 
 class DSDLMultiLabelMAPEngine(Engine):
     """ DSDL Multi-label Engine """
+
     def on_start_batch(self, training, model, criterion, data_loader, optimizer=None):
         self.state['target_gt'] = self.state['target'].clone()
         input = self.state['input']
-        fusion = input[0] # [B, 5, H, W]
-        
-        self.state['opt'] = fusion[:, :3, :, :]   # B02,B03,B04
-        self.state['sar'] = fusion[:, 3:5, :, :]  # VV,VH
-        self.state['out'] = input[1] # filenames
-        
+        fusion = input[0]  # [B, 5, H, W]
+
+        # BEN 特殊点：保留 3+2 通道输入
+        self.state['opt'] = fusion[:, :3, :, :]
+        self.state['sar'] = fusion[:, 3:5, :, :]
+        self.state['out'] = input[1]  # filenames
+
         inp = input[2]
         if isinstance(inp, (list, tuple)):
             inp = inp[0]
-        self.state['input'] = inp # semantic vectors
+        self.state['input'] = inp  # semantic vectors
 
     def on_forward(self, training, model, criterion, data_loader, optimizer=None):
         opt_var = self.state['opt'].float()
@@ -372,10 +384,10 @@ class DSDLMultiLabelMAPEngine(Engine):
             inp_var = inp_var.unsqueeze(0).expand(opt_var.size(0), -1, -1)
 
         self.state['output'], semantic, res_semantic, feature, deep_semantic = model(
-            opt_var, sar_var, inp_var
+            opt_var, sar_var, inp_var,
         )
         self.state['loss'] = criterion(
-            self.state['output'], target_var, semantic, res_semantic, feature, deep_semantic
+            self.state['output'], target_var, semantic, res_semantic, feature, deep_semantic,
         )
 
         if training:
